@@ -1,0 +1,97 @@
+name: apply-history-query-fix
+
+on:
+  push:
+    branches:
+      - codex/history-query-validation-refresh-20260724
+    paths:
+      - .github/workflows/apply-history-query-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: codex/history-query-validation-refresh-20260724
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Apply validated history query patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          server_path = Path("server.py")
+          server = server_path.read_text(encoding="utf-8")
+          old = '''        @routes.get("/history")
+                  async def get_history(request):
+                      max_items = request.rel_url.query.get("max_items", None)
+                      if max_items is not None:
+                          max_items = int(max_items)
+
+                      offset = request.rel_url.query.get("offset", None)
+                      if offset is not None:
+                          offset = int(offset)
+                      else:
+                          offset = -1
+
+                      return web.json_response(self.prompt_queue.get_history(max_items=max_items, offset=offset))
+          '''
+          new = '''        @routes.get("/history")
+                  async def get_history(request):
+                      query = request.rel_url.query
+                      try:
+                          max_items = parse_optional_int_query_param(query, "max_items")
+                          offset = parse_optional_int_query_param(query, "offset")
+                      except ValueError as exc:
+                          return web.json_response({"error": str(exc)}, status=400)
+
+                      if offset is None:
+                          offset = -1
+
+                      return web.json_response(self.prompt_queue.get_history(max_items=max_items, offset=offset))
+          '''
+          if old not in server:
+              raise SystemExit("expected /history route block not found")
+          server = server.replace(old, new, 1)
+
+          import_marker = "from api_server.routes.internal.internal_routes import InternalRoutes\n"
+          helper_import = "from api_server.utils.query_params import parse_optional_int_query_param\n"
+          if helper_import not in server:
+              if import_marker not in server:
+                  raise SystemExit("expected import marker not found")
+              server = server.replace(import_marker, import_marker + helper_import, 1)
+          server_path.write_text(server, encoding="utf-8")
+
+          helper = Path("api_server/utils/query_params.py")
+          helper.parent.mkdir(parents=True, exist_ok=True)
+          helper.write_text('''"""Helpers for validating optional HTTP query parameters."""\n\nfrom collections.abc import Mapping\n\n\ndef parse_optional_int_query_param(\n    query: Mapping[str, str], name: str\n) -> int | None:\n    """Return an optional integer query value or raise a stable validation error."""\n\n    value = query.get(name)\n    if value is None:\n        return None\n\n    try:\n        return int(value)\n    except (TypeError, ValueError) as exc:\n        raise ValueError(f"{name} must be an integer") from exc\n''', encoding="utf-8")
+
+          unit = Path("tests-unit/server/utils/query_params_test.py")
+          unit.parent.mkdir(parents=True, exist_ok=True)
+          unit.write_text('''import pytest\n\nfrom api_server.utils.query_params import parse_optional_int_query_param\n\n\ndef test_parse_optional_int_query_param_returns_none_when_missing():\n    assert parse_optional_int_query_param({}, "offset") is None\n\n\n@pytest.mark.parametrize(\n    ("raw_value", "expected"),\n    [("0", 0), ("5", 5), ("-1", -1)],\n)\ndef test_parse_optional_int_query_param_parses_integers(raw_value, expected):\n    assert parse_optional_int_query_param({"offset": raw_value}, "offset") == expected\n\n\n@pytest.mark.parametrize(\n    ("name", "raw_value"),\n    [\n        ("offset", "not-an-integer"),\n        ("offset", "1.5"),\n        ("offset", ""),\n        ("max_items", "not-an-integer"),\n    ],\n)\ndef test_parse_optional_int_query_param_rejects_invalid_integers(name, raw_value):\n    with pytest.raises(ValueError) as exc_info:\n        parse_optional_int_query_param({name: raw_value}, name)\n    assert str(exc_info.value) == f"{name} must be an integer"\n''', encoding="utf-8")
+
+          execution_path = Path("tests/execution/test_execution.py")
+          execution = execution_path.read_text(encoding="utf-8")
+          marker = '''        assert len(result) <= 1, "Should return at most 1 item when offset is near end"\n\n    # Jobs API tests\n'''
+          inserted = '''        assert len(result) <= 1, "Should return at most 1 item when offset is near end"\n\n    def test_history_api_rejects_non_integer_max_items(self, client: ComfyClient):\n        with pytest.raises(urllib.error.HTTPError) as exc_info:\n            client.get_all_history(max_items="not-an-integer")\n\n        assert exc_info.value.code == 400\n        assert json.loads(exc_info.value.read()) == {"error": "max_items must be an integer"}\n\n    def test_history_api_rejects_non_integer_offset(self, client: ComfyClient):\n        with pytest.raises(urllib.error.HTTPError) as exc_info:\n            client.get_all_history(offset="not-an-integer")\n\n        assert exc_info.value.code == 400\n        assert json.loads(exc_info.value.read()) == {"error": "offset must be an integer"}\n\n    # Jobs API tests\n'''
+          if marker not in execution:
+              raise SystemExit("expected history test insertion marker not found")
+          execution_path.write_text(execution.replace(marker, inserted, 1), encoding="utf-8")
+
+          Path(".github/workflows/apply-history-query-fix.yml").unlink()
+          PY
+      - name: Commit applied fix
+        shell: bash
+        run: |
+          git config user.name "grtninja-backlog-repair"
+          git config user.email "214726997+grtninja@users.noreply.github.com"
+          git add server.py api_server/utils/query_params.py tests-unit/server/utils/query_params_test.py tests/execution/test_execution.py .github/workflows/apply-history-query-fix.yml
+          git commit -m "fix: validate /history integer query parameters"
+          git push origin HEAD:codex/history-query-validation-refresh-20260724
